@@ -1,23 +1,31 @@
+<div align="center">
+
 # Windows Update Blocker
 
-Persistent, reversible blocking of Windows OS updates and their automatic restart workflow, using PowerShell and built-in Windows tools.
+**Keep Windows Update on your schedule.**
 
-The blocker runs at startup and every minute with no expiry. It saves original settings before changing them and includes status reporting, an integration check, and an undo script.
+Persistent, reversible Windows OS update blocking with PowerShell and built-in Windows tools.
 
-**Disabling Windows Update stops Windows security patches, feature updates, and drivers delivered through Windows Update.** This is a local workaround, not a guarantee against every future Windows repair, reinstall, or new updater mechanism. Review the scripts before running them.
+[![Source checks](https://github.com/HaiderAli3D/windows-update-blocker/actions/workflows/validate.yml/badge.svg)](https://github.com/HaiderAli3D/windows-update-blocker/actions/workflows/validate.yml)
+![Windows PowerShell 5.1](https://img.shields.io/badge/Windows_PowerShell-5.1-5391FE?logo=powershell&logoColor=white)
+[![Tested baseline: Windows 11](https://img.shields.io/badge/Tested_baseline-Windows_11-0078D4)](#validation-and-limits)
 
-## Requirements
+[Install](#install) · [Check status](#check-status) · [Restore](#restore-windows-update) · [How it works](#how-it-works) · [Validation](#validation-and-limits)
 
-- Windows with **64-bit Windows PowerShell 5.1** (`powershell.exe`), not PowerShell 7 (`pwsh`).
-- Administrator access to install, inspect protected tasks, and restore settings.
-- Task Scheduler and Windows Firewall available and enabled.
-- Initial live verification used Windows 11 Home 25H2 on x64. Other Windows versions and architectures have not been validated.
+</div>
 
-Windows Home does not have the documented Pro edition policy guarantees. Service and scheduled-task controls provide the primary block; the registry policies add another layer.
+> **Before you install:** this stops Windows security patches, feature updates, and drivers delivered through Windows Update. Review the scripts and keep the original settings backup. Persistence has no expiry, but future Windows repairs, reinstalls, or new update mechanisms can override it.
+
+- **Automatic enforcement.** Reapplies the block at startup and every minute.
+- **No wake-ups.** Runs on battery without waking the computer.
+- **Built-in undo.** Saves settings before changing them and restores them on request.
+- **Visible results.** Reports actual service, task, policy, and firewall state locally.
 
 ## Install
 
-Clone or download the repository, review its scripts, then open **Windows PowerShell as administrator** in the repository directory:
+You need **64-bit Windows PowerShell 5.1** (`powershell.exe`), administrator access, and working Task Scheduler and Windows Firewall services. PowerShell 7 (`pwsh`) and 32-bit hosts are rejected before changes begin. The original implementation was tested on **Windows 11 Home 25H2 x64**; other versions and architectures are unvalidated.
+
+Open **Windows PowerShell as administrator**, then:
 
 ```powershell
 git clone https://github.com/HaiderAli3D/windows-update-blocker.git
@@ -25,31 +33,15 @@ cd windows-update-blocker
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
 ```
 
-The execution-policy override applies only to that PowerShell process. If using a downloaded ZIP, extract its contents before running the installer.
+You can also [download the ZIP](https://github.com/HaiderAli3D/windows-update-blocker/archive/refs/heads/main.zip), extract it, and run the last command from the extracted directory. The execution-policy override applies only to that process.
 
-The installer creates `%ProgramData%\WindowsUpdateBlock` and the `WindowsUpdateBlock-Enforce` scheduled task. The installation directory permits writes only by SYSTEM and Administrators; ordinary users can read the scripts and reports. The task runs as SYSTEM at startup and every minute, including on battery, without waking the computer. No reboot is required.
+Installation creates `%ProgramData%\WindowsUpdateBlock` and the `WindowsUpdateBlock-Enforce` SYSTEM task. Only SYSTEM and Administrators can write to the installation directory. No reboot is required.
 
-An existing installation directory or task causes installation to stop rather than overwrite its backup. Do not run the installer against an active Windows servicing operation or delete a previous installation's backup to get past this check.
-
-## What it changes
-
-| Layer | Changes |
-| --- | --- |
-| Services | Stops and disables `wuauserv`, `UsoSvc`, `WaaSMedicSvc`, and `uhssvc` where present. |
-| Scheduled tasks | Disables tasks in Windows Update, Update Orchestrator, Medic, Update Assistant, and remediation folders where permissions allow. |
-| Network | Adds outbound blocks scoped to update service identities and update executables. |
-| Policies | Disables automatic updates, restricts Windows Update UI access, excludes update-delivered drivers, and configures a nonfunctional local update endpoint. |
-| Enforcement | Reapplies these settings every minute and at startup, recording failures and changes. |
-
-The installer also attempts to cancel an already queued shutdown once. It does not continuously cancel intentional restarts.
-
-BITS, Delivery Optimization, Defender, Microsoft Store services, browsers, and third-party updaters are not disabled. Store installations and Defender update paths that depend on Windows Update can nevertheless be affected. The scripts do not delete servicing files, update caches, pending-reboot markers, or existing scheduled tasks, and do not change system service/file ownership to bypass protections.
+Install while Windows is not actively servicing an update. An existing installation directory or enforcement task stops installation to preserve its backup; see [troubleshooting](#troubleshooting).
 
 ## Check status
 
-The latest SYSTEM-run report is `%ProgramData%\WindowsUpdateBlock\last-enforce.json`. Its timestamp, issues, service states, and task states matter; registration of the guard alone does not prove that the block works.
-
-For a fresh **read-only** report, run in an elevated Windows PowerShell window:
+For a fresh **read-only** report, use an elevated Windows PowerShell window:
 
 ```powershell
 $installRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'WindowsUpdateBlock'
@@ -57,58 +49,103 @@ $installRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData'))
 Get-ScheduledTaskInfo -TaskName 'WindowsUpdateBlock-Enforce'
 ```
 
-A completed guard run should return `LastTaskResult = 0`. A report written from inside a running guard may show `267009` (`0x41301`, task running); check the completed task separately. A non-elevated query may omit protected tasks.
+Check the report's timestamp, `Issues`, and blocked service/task results. A completed guard run should have `LastTaskResult = 0`. The latest report from the SYSTEM task is saved as `%ProgramData%\WindowsUpdateBlock\last-enforce.json`.
 
-### Optional integration check
+<details>
+<summary><strong>Advanced: test automatic enforcement</strong></summary>
+
+From the repository or installation directory, run as administrator:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Verify-Installed.ps1
 ```
 
-This is an **active test**, not a read-only status query. It checks that Windows rejects starting the disabled update service, briefly disables one of the blocker's own firewall rules while the update services remain disabled, and waits for the scheduled guard to restore that rule. It also checks scheduling, rule filters, firewall profiles, and the completed guard result. Allow roughly two minutes. Results are written to `%ProgramData%\WindowsUpdateBlock\verification.json`.
+This is an **active integration test**. It attempts to start the disabled update service and expects Windows to reject it, temporarily disables one owned firewall rule, and waits for the guard to restore that rule. Update services remain disabled during the firewall test. It also inspects scheduling, effective firewall filters, enabled profiles, and the completed guard result.
+
+Allow roughly two minutes. Results are saved to `%ProgramData%\WindowsUpdateBlock\verification.json`.
+
+</details>
 
 ## Restore Windows Update
 
-From the repository or installed folder, run:
+From the repository or installation directory:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Restore.ps1
 ```
 
-The script requests administrator approval if needed and starts restoration as SYSTEM. It disables the enforcement task, removes only the firewall rules it created, restores the registry values it changed, and re-enables update tasks that were originally enabled. It does not trigger an update scan or restart the PC. Restored service startup settings apply on their next normal trigger or next restart.
+The script requests administrator approval if needed, stops recurring enforcement, and starts restoration as SYSTEM. It restores saved registry settings, re-enables update tasks that were originally enabled, and removes its own firewall rules. It does not initiate an update scan or restart the PC. Restored service startup settings take effect on their next normal trigger or restart.
 
-Inspect `%ProgramData%\WindowsUpdateBlock\last-restore.json` for completion and errors. Successful restoration creates `RESTORED.txt` and removes the guard task. Backups and logs remain available. If restoration fails, the guard remains disabled and the backup remains available for retry or manual recovery. Missing original settings are an error; the scripts do not guess replacements.
+Check `%ProgramData%\WindowsUpdateBlock\last-restore.json` for completion and errors. Success creates `RESTORED.txt` and removes the guard task. Backups and logs remain available; missing original settings cause an error rather than guessed replacements.
 
-## Files and local data
+## How it works
+
+| Layer | Control |
+| --- | --- |
+| Services | Stops and disables Windows Update, Update Orchestrator, Medic, and Update Health services where present. |
+| Tasks | Disables tasks in update, orchestration, assistant, and remediation folders where permissions allow. |
+| Firewall | Blocks outbound traffic for selected update service identities and executables. |
+| Policies | Restricts automatic updates and Windows Update UI access, excludes update-delivered drivers, and sets a nonfunctional local update endpoint. |
+| Guard | Reapplies controls at startup and every minute, with changes and failures recorded locally. |
+
+<details>
+<summary><strong>Implementation details and scope</strong></summary>
+
+Service targets are `wuauserv`, `UsoSvc`, `WaaSMedicSvc`, and `uhssvc`. Windows Home lacks the documented Pro edition policy guarantees, so service and task controls provide the primary block. Available services, tasks, and firewall rules vary by Windows installation.
+
+The installer attempts to cancel a queued shutdown once. Intentional restarts are not continually intercepted. BITS, Delivery Optimization, Defender, Microsoft Store services, browsers, and third-party updaters are not disabled, although Store and Defender update paths that rely on Windows Update can be affected.
+
+The scripts preserve servicing files, update caches, pending-reboot markers, and existing tasks. They do not change system service or file ownership to bypass Windows protections. Installation uses a protected directory; enforcement and restoration share a mutex to prevent simultaneous changes.
+
+</details>
+
+<details>
+<summary><strong>Files, backups, and privacy</strong></summary>
 
 | File | Purpose |
 | --- | --- |
-| `Install.ps1` | Creates the protected installation and SYSTEM task. |
-| `UpdateBlock.ps1` | Applies controls, reports status, and restores backed-up settings. |
-| `Restore.ps1` | Starts restoration with the same SYSTEM privileges. |
-| `Verify-Installed.ps1` | Explicit integration test of an installed blocker. |
-| `tests/Test-Source.ps1` | Source checks that do not install the blocker or change Windows settings. |
+| [`Install.ps1`](Install.ps1) | Creates the protected installation and SYSTEM task. |
+| [`UpdateBlock.ps1`](UpdateBlock.ps1) | Enforces controls, reports status, and restores saved settings. |
+| [`Restore.ps1`](Restore.ps1) | Starts restoration with SYSTEM privileges. |
+| [`Verify-Installed.ps1`](Verify-Installed.ps1) | Tests an installed blocker's behavior. |
+| [`tests/Test-Source.ps1`](tests/Test-Source.ps1) | Validates source without changing Windows settings. |
 
-Runtime data stays in `%ProgramData%\WindowsUpdateBlock`: `original-state.clixml`, `last-enforce.json`, `last-restore.json`, `verification.json`, `install.log`, and activity logs. These can contain machine details and are excluded by `.gitignore`. Review and redact reports before sharing them in an issue.
+Runtime data stays in `%ProgramData%\WindowsUpdateBlock`: `original-state.clixml`, JSON reports, `install.log`, and activity logs. Reports and backups can contain machine details. They are excluded by `.gitignore`; review and redact them before sharing an issue. Keep `original-state.clixml` for restoration.
+
+</details>
 
 ## Validation and limits
 
-The original installed implementation was exercised on Windows 11 Home 25H2 x64: the update service rejected a start request with error 1058, a completed guard returned 0, and a deliberately changed firewall rule was restored automatically. Three services, 17 update tasks, and six firewall rules were observed on that machine; counts vary by installation.
+The **original installed implementation** passed live checks on Windows 11 Home 25H2 x64: Windows rejected a service start with error `1058`, a completed guard returned `0`, and the guard automatically restored a changed firewall rule.
 
-This repository includes subsequent portability and validation changes. Its CI performs source checks only. Those changes have not yet undergone a fresh-machine installation, full restore cycle, reboot test, or overnight test. A Windows VM with a snapshot is appropriate for those checks; do not run installation or integration scripts as part of routine CI on a shared machine.
+The repository adds portability and verification changes. **CI validates source only**; these changes have not completed a fresh-machine install, full restore cycle, reboot test, or overnight test. The badge above reflects that source workflow. A Windows VM with a snapshot is appropriate for integration testing.
 
-The periodic guard has a timing window. Already-staged servicing, power loss, crashes, deliberate restarts, third-party restarts, disabled supporting services, or future Windows repair/install operations are outside a permanent guarantee. Protected operations that fail are reported rather than silently treated as successful.
+The one-minute guard has a timing window. Already-staged servicing, future repair/install operations, disabled supporting services, crashes, power loss, and restarts initiated by people or other software are outside its guarantee. Failed protected operations appear in reports.
 
-To run the same source validation as CI:
+To run the same safe source checks as CI:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Source.ps1
 ```
 
-## Microsoft documentation
+## Troubleshooting
 
-- [Windows Update policy and registry settings](https://learn.microsoft.com/en-us/windows/deployment/update/waas-wu-settings)
-- [Update policy edition applicability](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-update#allowautoupdate)
-- [Restart policy limitations](https://learn.microsoft.com/en-us/windows/deployment/update/waas-restart)
-- [Service-scoped Windows Firewall rules](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/configure)
-- [Windows Update repair components](https://support.microsoft.com/en-us/servicing/os/windows-10/2020/11/kb4023057-update-health-tools-windows-update-service-components)
+<details>
+<summary><strong>Installation stopped, reports look incomplete, or restore needs attention</strong></summary>
+
+- **Existing installation:** inspect its reports and backup first. Do not delete the backup to bypass the installer's check. Restore the existing installation before preparing a new one.
+- **Task result `267009` (`0x41301`):** the guard was running when queried. Check again after it finishes; use the completed task result.
+- **Incomplete report:** use an elevated shell so protected tasks are visible, then inspect `Issues` in the latest SYSTEM-run report. Registration of the guard alone does not prove every control succeeded.
+- **Firewall verification failure:** check that all three firewall profiles are enabled and inspect the reported rule/filter mismatch. Policies managed by an organization may affect effective settings.
+- **Restore errors:** inspect `last-restore.json`. On a reported restoration failure, recurring enforcement remains disabled and the backup remains available for retry or manual recovery.
+
+</details>
+
+For bug reports, include your Windows edition/version, PowerShell version, and the relevant **redacted** error. Run source checks before proposing a change; never run installer or integration scripts as routine CI on a shared machine.
+
+<details>
+<summary><strong>Microsoft reference documentation</strong></summary>
+
+[Update policies](https://learn.microsoft.com/en-us/windows/deployment/update/waas-wu-settings) · [Edition applicability](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-update#allowautoupdate) · [Restart behavior](https://learn.microsoft.com/en-us/windows/deployment/update/waas-restart) · [Firewall rules](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/configure) · [Update repair components](https://support.microsoft.com/en-us/servicing/os/windows-10/2020/11/kb4023057-update-health-tools-windows-update-service-components)
+
+</details>
