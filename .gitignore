@@ -1,0 +1,22 @@
+# Machine settings, diagnostic reports, and backups must remain local.
+*.clixml
+*.reg
+*.log
+/last-*.json
+/verification.json
+/RESTORED.txt
+/WindowsUpdateBlock/
+
+# Credentials and local editor state.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+.vscode/
+.idea/
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
