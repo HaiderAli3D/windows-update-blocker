@@ -16,7 +16,7 @@ foreach ($scriptFile in $scripts) {
     }
 }
 
-foreach ($name in @('Install.ps1','UpdateBlock.ps1','Restore.ps1','Verify-Installed.ps1','README.md','.gitignore')) {
+foreach ($name in @('Install.ps1','Upgrade.ps1','UpdateBlock.ps1','GuardTask.ps1','Restore.ps1','Verify-Installed.ps1','README.md','.gitignore')) {
     if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $name) -PathType Leaf)) { $failures.Add("Missing packaged file: $name") }
 }
 
@@ -49,6 +49,23 @@ if ($roundTrip.Registry['sample|Start'].Value -cne 3 -or $roundTrip.Registry['sa
 if ($roundTrip.Registry['sample|Missing'].Exists -or $null -ne $roundTrip.Registry['sample|Missing'].Value) { $failures.Add('Missing registry value did not survive backup serialization.') }
 if ($roundTrip.Registry['sample|Path'].Value -cne $backup.Registry['sample|Path'].Value -or $roundTrip.Registry['sample|Path'].Kind -cne 'ExpandString') { $failures.Add('Unexpanded registry string changed during backup serialization.') }
 if ($roundTrip.Tasks['sample'].Enabled -or -not $roundTrip.FirewallRules.ContainsKey('example-owned-rule')) { $failures.Add('Task/rule ownership state changed during backup serialization.') }
+
+# GuardTask.ps1 only defines values and functions, so it is safe to load here.
+. (Join-Path $repoRoot 'GuardTask.ps1')
+try {
+    [xml]$subscription = Get-GuardSubscription
+    $selects = @($subscription.QueryList.Query.Select)
+    if ($selects.Count -ne 3) { $failures.Add("Guard subscription has $($selects.Count) selects; expected 3.") }
+    if ((Get-GuardSubscription) -match 'EventID=7036') { $failures.Add('Guard subscription relies on event 7036, which current Windows builds do not log.') }
+    if ((Get-GuardSubscription) -notmatch "Data\[@Name='param4'\]='wuauserv'") { $failures.Add('Guard subscription does not watch wuauserv start-type changes.') }
+} catch { $failures.Add("Guard subscription is not valid XML: $($_.Exception.Message)") }
+foreach ($fileName in $installedFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $fileName) -PathType Leaf)) { $failures.Add("Installed file missing from repository: $fileName") }
+}
+$ruleNames = @(Get-UpdatePrograms | ForEach-Object { Get-ProgramRuleName $_ })
+if (@($ruleNames | Select-Object -Unique).Count -ne $ruleNames.Count) { $failures.Add('Firewall program rule names are not unique.') }
+# Installed backups record these names; renaming them would orphan existing rules.
+if ((Get-ProgramRuleName "$env:SystemRoot\System32\UsoClient.exe") -cne 'WindowsUpdateBlock-Program-System32-UsoClient-exe') { $failures.Add('Existing firewall rule naming changed.') }
 
 if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
 Write-Output "PASS: $($scripts.Count) PowerShell files parse; package manifest and backup serialization checks passed. No Windows settings changed."

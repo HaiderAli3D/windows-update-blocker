@@ -26,6 +26,8 @@ $action=New-ScheduledTaskAction -Execute $psExe -Argument $actionArguments -Work
 # Retain SYSTEM rights so protected tasks are restored under the same identity.
 $task.Actions=@($action)
 $task.Triggers=@()
+# A queued enforcement run must not interleave with restoration.
+$task.Settings.MultipleInstances='IgnoreNew'
 $task.Settings.Enabled=$true
 Set-ScheduledTask -InputObject $task | Out-Null
 Start-ScheduledTask -TaskName $taskName

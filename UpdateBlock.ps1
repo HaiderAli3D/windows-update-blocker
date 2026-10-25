@@ -7,6 +7,7 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $PSVersionTa
     throw 'Use 64-bit Windows PowerShell 5.1 (Desktop edition) on Windows. PowerShell 7 and 32-bit hosts are not supported.'
 }
 $root = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'WindowsUpdateBlock'
+. (Join-Path $PSScriptRoot 'GuardTask.ps1')
 $statePath = Join-Path $root 'original-state.clixml'
 $taskName = 'WindowsUpdateBlock-Enforce'
 $ruleGroup = 'Windows Update Block (local owner request)'
@@ -19,6 +20,9 @@ $taskPaths = @(
     '\Microsoft\Windows\WindowsUpdateUpdateServices\',
     '\Microsoft\Windows\rempl\'
 )
+# Store app auto-update tasks wake Windows Update. RestoreDevice restores apps on new devices and is kept.
+$storeTaskPath = '\Microsoft\Windows\InstallService\'
+$storeTaskExclusions = @('RestoreDevice')
 $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $policies = @(
     @{Path="$policyPath\AU"; Name='NoAutoUpdate'; Value=1; Kind='DWord'},
@@ -27,7 +31,11 @@ $policies = @(
     @{Path=$policyPath; Name='ExcludeWUDriversInQualityUpdate'; Value=1; Kind='DWord'},
     @{Path=$policyPath; Name='WUServer'; Value='http://127.0.0.1:9'; Kind='String'},
     @{Path=$policyPath; Name='WUStatusServer'; Value='http://127.0.0.1:9'; Kind='String'},
-    @{Path="$policyPath\AU"; Name='UseWUServer'; Value=1; Kind='DWord'}
+    @{Path="$policyPath\AU"; Name='UseWUServer'; Value=1; Kind='DWord'},
+    # Device installation settings; honored on Home, unlike the policies above.
+    @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching'; Name='SearchOrderConfig'; Value=0; Kind='DWord'},
+    @{Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching'; Name='DontSearchWindowsUpdate'; Value=1; Kind='DWord'},
+    @{Path='HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; Name='AutoDownload'; Value=2; Kind='DWord'}
 )
 $script:issues = New-Object 'System.Collections.Generic.List[string]'
 $script:changed = New-Object 'System.Collections.Generic.List[string]'
@@ -68,7 +76,7 @@ function Set-BackedValue([string]$Path,[string]$Name,$Value,[string]$Kind) {
 
 function Get-UpdateTasks {
     # Enumeration under SYSTEM includes protected folders hidden from a normal user.
-    @(Get-ScheduledTask | Where-Object { $_.TaskPath -in $taskPaths })
+    @(Get-ScheduledTask | Where-Object { $_.TaskPath -in $taskPaths -or ($_.TaskPath -eq $storeTaskPath -and $_.TaskName -notin $storeTaskExclusions) })
 }
 
 function Get-RuleSpecifications {
@@ -81,21 +89,13 @@ function Get-RuleSpecifications {
             } else { $script:issues.Add("Firewall service filter unavailable: $name has no service SID") }
         }
     }
-    $programs = @(
-        "$env:SystemRoot\System32\UsoClient.exe",
-        "$env:SystemRoot\System32\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\uus\AMD64\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\uus\ARM64\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\System32\SIHClient.exe",
-        "$env:SystemRoot\System32\WaaSMedicAgent.exe"
-    )
-    foreach ($program in $programs) {
+    foreach ($program in (Get-UpdatePrograms)) {
         if (Test-Path -LiteralPath $program -PathType Leaf) {
-            $suffix = $program.Substring($env:SystemRoot.Length).Replace('\','-').Replace('.','-')
-            @{Name="WindowsUpdateBlock-Program$suffix"; Program=$program; Service='Any'}
+            @{Name=(Get-ProgramRuleName $program); Program=$program; Service='Any'}
         }
     }
 }
+
 
 function Get-Report {
     $services = @(foreach($name in $serviceNames) {
@@ -116,8 +116,11 @@ function Get-Report {
     $profiles = @(Get-NetFirewallProfile | Select-Object Name,Enabled)
     $guard = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $guardInfo = if($guard){Get-ScheduledTaskInfo -TaskName $taskName}else{$null}
+    $sku = (Get-CimInstance Win32_OperatingSystem).OperatingSystemSKU
     [ordered]@{
         Time=(Get-Date).ToString('o'); Mode=$Mode; User=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+        # Home editions (SKU 98-101) ignore Windows Update policies; services, tasks and the guard are the effective block there.
+        OperatingSystemSKU=$sku; IsHomeEdition=($sku -in @(98,99,100,101))
         Services=$services; UpdateTasks=$updateTasks; FirewallRules=$rules; FirewallProfiles=$profiles; Policies=$policyChecks
         Guard=if($guard){[ordered]@{Enabled=$guard.Settings.Enabled; State=$guard.State.ToString(); User=$guard.Principal.UserId; LastRun=$guardInfo.LastRunTime; LastResult=$guardInfo.LastTaskResult; NextRun=$guardInfo.NextRunTime}}else{$null}
         PrimaryUpdateServicesBlocked=(@($services | Where-Object {$_.Name -in @('wuauserv','UsoSvc') -and $_.Blocked}).Count -eq 2)

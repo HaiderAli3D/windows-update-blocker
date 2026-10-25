@@ -7,6 +7,7 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $PSVersionTa
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run installed verification as administrator.' }
 $root = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'WindowsUpdateBlock'
+. (Join-Path $PSScriptRoot 'GuardTask.ps1')
 $taskName='WindowsUpdateBlock-Enforce'
 $ruleGroup='Windows Update Block (local owner request)'
 $ruleName=$null
@@ -22,16 +23,8 @@ try {
     foreach ($serviceName in @('wuauserv','UsoSvc','WaaSMedicSvc','uhssvc')) {
         $expectedFilters["WindowsUpdateBlock-Service-$serviceName"]=@{Program="$env:SystemRoot\System32\svchost.exe";Service=$serviceName}
     }
-    foreach ($program in @(
-        "$env:SystemRoot\System32\UsoClient.exe",
-        "$env:SystemRoot\System32\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\uus\AMD64\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\uus\ARM64\MoUsoCoreWorker.exe",
-        "$env:SystemRoot\System32\SIHClient.exe",
-        "$env:SystemRoot\System32\WaaSMedicAgent.exe"
-    )) {
-        $suffix=$program.Substring($env:SystemRoot.Length).Replace('\','-').Replace('.','-')
-        $expectedFilters["WindowsUpdateBlock-Program$suffix"]=@{Program=$program;Service='Any'}
+    foreach ($program in (Get-UpdatePrograms)) {
+        $expectedFilters[(Get-ProgramRuleName $program)]=@{Program=$program;Service='Any'}
     }
     foreach ($name in $expectedNames) {
         if (-not $expectedFilters.ContainsKey($name)) { throw "The backup contains an unknown owned firewall rule: $name" }
@@ -46,7 +39,14 @@ try {
     $repeat=$xml.SelectSingleNode('/t:Task/t:Triggers/t:TimeTrigger/t:Repetition',$ns)
     if (-not $boot -or $repeat.Interval -ne 'PT1M' -or $repeat.Duration) { throw 'The task lacks startup plus indefinite one-minute enforcement.' }
     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or $task.Settings.WakeToRun) { throw 'Task battery/wake settings are unexpected.' }
-    $evidence.Task=[ordered]@{User=$task.Principal.UserId;BootTrigger=$true;Interval=$repeat.Interval;Duration='Indefinite';RunsOnBattery=$true;WakesComputer=$false;Action=$task.Actions.Arguments}
+    $eventTriggers=$xml.SelectNodes('/t:Task/t:Triggers/t:EventTrigger',$ns)
+    if ($eventTriggers.Count -ne 1) { throw 'The task lacks its update-service event trigger. Run Upgrade.ps1.' }
+    # Exported XML omits default values, so a missing Enabled element means enabled.
+    $eventEnabled=$eventTriggers[0].SelectSingleNode('t:Enabled',$ns)
+    if ($eventEnabled -and $eventEnabled.InnerText -eq 'false') { throw 'The update-service event trigger is disabled.' }
+    if ($eventTriggers[0].SelectSingleNode('t:Subscription',$ns).InnerText -ne (Get-GuardSubscription)) { throw 'The event trigger subscription differs from the expected configuration.' }
+    if ($task.Settings.MultipleInstances -ne 'Queue') { throw 'The task must queue overlapping runs so no service change is ignored.' }
+    $evidence.Task=[ordered]@{User=$task.Principal.UserId;BootTrigger=$true;Interval=$repeat.Interval;Duration='Indefinite';EventTrigger=$true;MultipleInstances='Queue';RunsOnBattery=$true;WakesComputer=$false;Action=$task.Actions.Arguments}
 
     # Prove that an actual service-start request is rejected by the service manager.
     $service=Get-Service -Name wuauserv
@@ -60,6 +60,21 @@ try {
         while ($exception.InnerException) { $exception=$exception.InnerException }
         if ($exception -isnot [ComponentModel.Win32Exception] -or $exception.NativeErrorCode -ne 1058) { throw }
         $evidence.ServiceStartTest=[ordered]@{Rejected=$true;Win32Error=1058;Meaning='Service disabled'}
+    }
+
+    # Reproduce what Windows Update API callers do (disabled -> demand start) and time the event-driven correction.
+    $flipStart=Get-Date
+    try {
+        $null = & "$env:SystemRoot\System32\sc.exe" config wuauserv start= demand 2>&1
+        $deadline=$flipStart.AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 500
+            $startType=(Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv' -Name Start).Start
+        } while ($startType -ne 4 -and (Get-Date) -lt $deadline)
+        if ($startType -ne 4) { throw 'The event-triggered guard did not disable Windows Update again within 30 seconds.' }
+        $evidence.EventReapplicationTest=[ordered]@{Service='wuauserv';Restored=$true;Seconds=[math]::Round(((Get-Date)-$flipStart).TotalSeconds,1)}
+    } finally {
+        if ((Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv' -Name Start).Start -ne 4) { $null = & "$env:SystemRoot\System32\sc.exe" config wuauserv start= disabled 2>&1 }
     }
 
     # Keep every update service stopped; test only restoration of our own extra firewall layer.
@@ -87,7 +102,7 @@ try {
     if ($task.State -eq 'Running' -or $info.LastTaskResult -ne 0) { throw "The verification run did not finish successfully: $($info.LastTaskResult)" }
     $report=Get-Content -LiteralPath (Join-Path $root 'last-enforce.json') -Raw | ConvertFrom-Json
     if ([datetimeoffset]::Parse($report.Time) -lt $start -or $report.Issues.Count -gt 0 -or -not $report.AllPresentUpdateServicesBlocked -or -not $report.AllVisibleUpdateTasksDisabled) { throw 'The fresh guard report is incomplete.' }
-    if (@($report.Policies).Count -ne 7 -or @($report.Policies | Where-Object {-not $_.Matches}).Count -gt 0) { throw 'A policy differs from the expected configuration.' }
+    if (@($report.Policies).Count -ne 10 -or @($report.Policies | Where-Object {-not $_.Matches}).Count -gt 0) { throw 'A policy differs from the expected configuration.' }
     # Inspect the effective firewall configuration, including its actual filters.
     $rules=@(Get-NetFirewallRule -PolicyStore ActiveStore -Group $ruleGroup)
     $actualNames=@($rules.Name | Sort-Object)
@@ -109,6 +124,7 @@ try {
     $evidence.CompletedTaskResult=$info.LastTaskResult
     $evidence.CompletedTaskLastRun=$info.LastRunTime.ToString('o')
     $evidence.FinalReport=$report
+    if ($report.IsHomeEdition) { $evidence.Warning='Home edition: Windows Update policies are not enforced and third-party network filters can override firewall rules. Disabled services, disabled tasks and the guard are the effective block.' }
     $evidence.PreservedServices=@(Get-CimInstance Win32_Service -Filter "Name='BITS' OR Name='DoSvc' OR Name='WinDefend'" | Select-Object Name,State,StartMode)
     $evidence.Passed=$true
 } catch {
